@@ -286,6 +286,10 @@ class HstuAttnVarlenFunc(torch.autograd.Function):
                 alpha,
                 rab,
                 func,
+                paged_kv = kv_cache,
+                page_ids = page_ids,
+                page_indptrs = page_offsets,
+                last_page_lens = last_page_lens,
             )
 
         ctx.save_for_backward(

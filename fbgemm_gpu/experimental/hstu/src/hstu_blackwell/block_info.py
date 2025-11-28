@@ -19,6 +19,7 @@ class BlockInfo:
     is_context: cutlass.Constexpr[bool] = False
     is_target: cutlass.Constexpr[bool] = False
     target_group_size: cutlass.Constexpr[int] = 1
+    is_paged: cutlass.Constexpr[bool] = False
     window_size_left: Optional[cutlass.Int32] = None
     window_size_right: Optional[cutlass.Int32] = None
     sn_valid_block_max: cute.Pointer = None
@@ -31,7 +32,7 @@ class BlockInfo:
 
     @cute.jit
     def get_n_block_info(
-        self, seqlen_info: SeqlenInfo, m_block: cutlass.Int32
+        self, seqlen_info: SeqlenInfo, m_block: cutlass.Int32  # m_block is in delta Q
     ) -> Tuple[cutlass.Int32, cutlass.Int32]:
         is_jump = self.is_target and m_block * self.kBlockM > seqlen_info.seqlen_h
         is_in_context = self.is_context and (m_block + 1) * self.kBlockM <= seqlen_info.seqlen_c
@@ -49,16 +50,37 @@ class BlockInfo:
             n_block_min = 0 if (is_in_context or is_in_mixed_context) else n_block_min
             n_block_max = max(cute.ceil_div(seqlen_info.seqlen_h, self.kBlockN), n_block_max) if (is_in_context or is_in_mixed_context) else n_block_max
 
-        n_masking_block_max = cute.ceil_div(min(seqlen_info.seqlen_k, (m_block + 1) * self.kBlockM + seqlen_offset), self.kBlockN)
-        n_masking_block_min = (m_block * self.kBlockM + seqlen_offset) // self.kBlockN
-        if self.is_target:
-            n_masking_block_min = (seqlen_info.seqlen_h + seqlen_offset + target_index * self.target_group_size) // self.kBlockN if is_jump else n_masking_block_min
-        if self.is_context:
-            n_masking_block_min = n_block_min if is_in_mixed_context else n_masking_block_min
-            n_masking_block_max = n_block_max if is_in_mixed_context else n_masking_block_max
+        n_masking_steps = 0
+        n_block_target_min = 0
+        if not self.is_paged:
+            n_masking_block_max = cute.ceil_div(min(seqlen_info.seqlen_k, (m_block + 1) * self.kBlockM + seqlen_offset), self.kBlockN)
+            n_masking_block_min = (m_block * self.kBlockM + seqlen_offset) // self.kBlockN
+            if self.is_target:
+                n_masking_block_min = (seqlen_info.seqlen_h + seqlen_offset + target_index * self.target_group_size) // self.kBlockN if is_jump else n_masking_block_min
+            if self.is_context:
+                n_masking_block_min = n_block_min if is_in_mixed_context else n_masking_block_min
+                n_masking_block_max = n_block_max if is_in_mixed_context else n_masking_block_max
 
-        n_masking_steps = 0 if (not self.is_causal or is_in_context) else n_masking_block_max - n_masking_block_min
-        return n_block_max, n_block_min, n_masking_steps, is_jump, n_block_history
+            n_masking_steps = 0 if (not self.is_causal or is_in_context) else n_masking_block_max - n_masking_block_min
+        else:
+            n_block_history = min(n_block_history, n_block_max)
+            is_jump = self.is_target and m_block * self.kBlockM + seqlen_offset > seqlen_info.seqlen_h
+            n_masking_pages = 0
+            if m_block * self.kBlockM + seqlen_offset < seqlen_info.seqlen_h:
+                n_masking_pages = cute.ceil_div(min(seqlen_info.seqlen_h, (m_block + 1) * self.kBlockM + seqlen_offset), self.kBlockN)
+                n_masking_pages -= (m_block * self.kBlockM + seqlen_offset) // self.kBlockN
+            n_masking_targets = 0
+            n_block_target_min = n_block_history
+            if self.is_target and (m_block + 1) * self.kBlockM + seqlen_offset > seqlen_info.seqlen_h:
+                n_block_target_min = max(m_block * self.kBlockM + seqlen_offset - seqlen_info.seqlen_h, 0) // self.kBlockN + n_block_history
+                n_block_target_max = cute.ceil_div(min((m_block + 1) * self.kBlockM + seqlen_offset, seqlen_info.seqlen_k) - seqlen_info.seqlen_h, self.kBlockN) + n_block_history
+                n_masking_targets = n_block_target_max - n_block_target_min
+                n_block_max = n_block_target_max
+            # n_block_max = n_block_history + cute.ceil_div(seqlen_info.seqlen_k - seqlen_info.seqlen_h, self.kBlockN)
+            # n_masking_steps = n_masking_pages if not is_jump else 0 + n_masking_targets  # n_masking_pages is already 0 for is_jump
+            n_masking_steps = n_masking_pages + n_masking_targets
+
+        return n_block_max, n_block_min, n_masking_steps, is_jump, n_block_history, n_block_target_min
 
 
     @cute.jit

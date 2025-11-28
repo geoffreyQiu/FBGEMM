@@ -35,6 +35,10 @@ def hstu_varlen_fwd_100(
     alpha: float,
     rab: torch.Tensor,
     func: torch.Tensor,
+    paged_kv: torch.Tensor = None,
+    page_ids: torch.Tensor = None,
+    page_indptrs: torch.Tensor = None,
+    last_page_lens: torch.Tensor = None,
 ):
     head_dim = q.shape[2]
     head_dim_v = v.shape[2]
@@ -51,6 +55,10 @@ def hstu_varlen_fwd_100(
     assert not (is_target and not is_causal), "Target mask is True, but causal mask is False, this is undefined behavior."
     is_arbitrary = func is not None
     func_num = func.shape[-2] if func is not None else 0
+    is_paged = paged_kv is not None
+    assert not (is_paged and not is_causal), "Paged KV is True, but causal mask is False, this is undefined behavior."
+    assert not (is_paged and is_arbitrary), "Paged KV is True, but arbitrary mask is False, this is undefined behavior."
+    assert not (paged_kv is not None and (page_ids is None or page_indptrs is None or last_page_lens is None)), "Paged KV is True, but page metadata is missing"
 
     out = torch.empty_like(q)
     q_tensor, k_tensor, v_tensor, o_tensor = [
@@ -66,7 +74,19 @@ def hstu_varlen_fwd_100(
         for t in (num_contexts, num_targets, func)
     ]
     current_stream = cutlass_torch.default_stream()
-    compile_key = (head_dim, kBlockM, kBlockN, is_causal, is_local, is_context, is_target, target_group_size, is_arbitrary, func_num)
+    compile_key = (head_dim, kBlockM, kBlockN, is_causal, is_local, is_context, is_target, target_group_size, is_arbitrary, is_paged, func_num)
+    
+    if is_paged:
+        paged_kv = paged_kv.view(-1, paged_kv.shape[-2], paged_kv.shape[-1])
+        paged_kv = from_dlpack(paged_kv.detach(), assumed_align=16).mark_layout_dynamic(leading_dim=paged_kv.ndim - 1)
+        page_ids = from_dlpack(page_ids.detach(), assumed_align=16).mark_layout_dynamic(leading_dim=page_ids.ndim - 1)
+        page_indptrs = from_dlpack(page_indptrs.detach(), assumed_align=16).mark_layout_dynamic(leading_dim=page_indptrs.ndim - 1)
+        last_page_lens = from_dlpack(last_page_lens.detach(), assumed_align=16).mark_layout_dynamic(leading_dim=last_page_lens.ndim - 1)
+    else:
+        paged_kv = None
+        page_ids = None
+        page_indptrs = None
+        last_page_lens = None
 
     if compile_key not in hstu_varlen_fwd_100.compile_cache:
         hstu_fwd_sm100 = HSTUAttentionForwardSm100(
@@ -77,15 +97,17 @@ def hstu_varlen_fwd_100(
             is_target=is_target,
             target_group_size=target_group_size,
             is_arbitrary=is_arbitrary,
+            is_paged=is_paged,
             func_num=func_num,
             kBlockM=kBlockM,
             kBlockN=kBlockN,
         )
         with torch.cuda.nvtx.range("hstu_varlen_fwd_kernel"):
-            hstu_varlen_fwd_100.compile_cache[compile_key] = cute.compile(hstu_fwd_sm100, q_tensor, k_tensor, v_tensor, o_tensor, max_seqlen_q, max_seqlen_k, cu_seqlens_q_tensor, cu_seqlens_k_tensor, num_contexts_tensor, num_targets_tensor, alpha, current_stream, window_size_left, window_size_right, func_tensor)
+            hstu_varlen_fwd_100.compile_cache[compile_key] = cute.compile(hstu_fwd_sm100, q_tensor, k_tensor, v_tensor, o_tensor, max_seqlen_q, max_seqlen_k, cu_seqlens_q_tensor, cu_seqlens_k_tensor, num_contexts_tensor, num_targets_tensor, alpha, current_stream, window_size_left, window_size_right, func_tensor, paged_kv, page_ids, page_indptrs, last_page_lens)
+    print("Compile done")
     
     with torch.cuda.nvtx.range("hstu_varlen_fwd_kernel"):
-        hstu_varlen_fwd_100.compile_cache[compile_key](q_tensor, k_tensor, v_tensor, o_tensor, max_seqlen_q, max_seqlen_k, cu_seqlens_q_tensor, cu_seqlens_k_tensor, num_contexts_tensor, num_targets_tensor, alpha, current_stream, window_size_left, window_size_right, func_tensor)
+        hstu_varlen_fwd_100.compile_cache[compile_key](q_tensor, k_tensor, v_tensor, o_tensor, max_seqlen_q, max_seqlen_k, cu_seqlens_q_tensor, cu_seqlens_k_tensor, num_contexts_tensor, num_targets_tensor, alpha, current_stream, window_size_left, window_size_right, func_tensor, paged_kv, page_ids, page_indptrs, last_page_lens)
 
     return out, None
 

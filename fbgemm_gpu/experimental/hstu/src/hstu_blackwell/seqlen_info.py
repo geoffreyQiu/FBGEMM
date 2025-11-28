@@ -19,6 +19,8 @@ class SeqlenInfo:
         cu_seqlens_k: cute.Tensor,
         num_contexts: Optional[cute.Tensor],
         num_targets: Optional[cute.Tensor],
+        page_indptrs: Optional[cute.Tensor],
+        last_page_lens: Optional[cute.Tensor],
     ):
         assert cu_seqlens_q is not None and cu_seqlens_k is not None
         self.offset_q = cu_seqlens_q[batch_idx]
@@ -30,3 +32,8 @@ class SeqlenInfo:
 
         self.max_seqlen_q = max_seqlen_q
         self.max_seqlen_k = max_seqlen_k
+
+        self.page_ind = page_indptrs[batch_idx] if page_indptrs is not None else 0
+        # self.num_pages = page_indptrs[batch_idx + 1] - self.page_ind
+        # self.last_page_lens = last_page_lens[batch_idx]
+

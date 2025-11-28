@@ -66,7 +66,14 @@ class AttentionMask:
         n_block: cutlass.Int32,
         thr_mma: cute.TiledMma,
         thr_tmem_load: cute.TiledCopy,
+        page_offset: cutlass.Int32 = cutlass.Int32(0),
     ) -> None:
+        # tidx = cute.arch.thread_idx()[0]
+        # if tidx % cute.arch.WARP_SIZE == 0:
+        #     cute.printf("mb_id: {}, nb_id: {}", m_block, n_block)
+        #     cute.printf("mblk: {}, nblk: {}", self.kBlockM, self.kBlockN)
+        #     cute.printf("page_offset: {}", page_offset)
+
         seqlen_offset = self.seqlen_k - self.seqlen_q
         cS = cute.make_identity_tensor((self.kBlockM, self.kBlockN))
         tScS = thr_mma.partition_C(cS)
@@ -86,6 +93,16 @@ class AttentionMask:
 
         col_limit_right = limit_right(row)
         col_limit_left = limit_left(row)
+
+        if page_offset > 0:
+            base_col += self.seqlen_h
+            # if m_block == 3 and n_block == 0:
+            #     cute.printf("base_col: {} ? {} ", base_col, col_limit_right)
+        elif page_offset < 0:
+            col_limit_right = min(col_limit_right, self.seqlen_h)
+            # target_col_limit_left = self.seqlen_k
+            # if m_block == 3 and n_block == 3:
+            #     cute.printf("col_limit_right: {} ? {} ", row, col_limit_right)
 
         for i in cutlass.range_constexpr(cute.size(preds), unroll_full=True):
             preds[i] = True

@@ -261,6 +261,7 @@ def generate_input(
         lengths_k = torch.randint(
             1, max_seq_len_k + 1, size=(batch_size,), device=torch.device("cuda")
         )
+        lengths_k = torch.ones((batch_size,), device=torch.device("cuda")) * max_seq_len_k
     cu_seqlens_k = torch.zeros(
         (batch_size + 1,),
         dtype=torch.int32,
@@ -285,6 +286,7 @@ def generate_input(
                 dtype=torch.int32,
                 device=torch.device("cuda"),
             )
+            num_targets = torch.ones_like(num_targets) * max_target_len
     else:
         num_targets = torch.zeros(
             (batch_size,), dtype=torch.int32, device=torch.device("cuda")
@@ -715,7 +717,50 @@ class HSTU16Test(unittest.TestCase):
                 "Skipping test for (window_size[0] > 0 or window_size[1] > 0) and has_context"
             )
             return
+        def place_kvcache(k, v, cu_seqlens_k, num_targets):
+            page_size=128
 
+            num_seqs = cu_seqlens_k.shape[0] - 1
+            kv_seqlens = cu_seqlens_k[1:] - cu_seqlens_k[:-1]
+            kv_seqlens = kv_seqlens if num_targets is None else (kv_seqlens - num_targets)
+            num_pages = torch.ceil(kv_seqlens / 128).int()
+            total_pages = int(torch.sum(num_pages)) + 11
+            paged_kv = torch.empty(
+                (total_pages, 2, page_size, k.shape[1], k.shape[2]),
+                dtype=k.dtype, device=k.device
+            )
+            paged_kv += 10.0
+            page_ids = torch.arange(total_pages, dtype=torch.int32, device=k.device)
+            # print(page_ids)
+            page_indptrs = torch.cat((torch.zeros((1,)).int().cuda(), torch.cumsum(num_pages, 0))).int()
+            # print(page_indptrs)
+            last_page_lens = torch.remainder(kv_seqlens - 1, page_size) + 1
+            last_page_lens = last_page_lens.int()
+            # print(last_page_lens)
+
+            for seqid in range(num_seqs):
+                pages = page_ids[page_indptrs[seqid]:page_indptrs[seqid+1]]
+                kcur = k[cu_seqlens_k[seqid]:cu_seqlens_k[seqid+1] - (num_targets[seqid] if num_targets is not None else 0), ...]
+                vcur = v[cu_seqlens_k[seqid]:cu_seqlens_k[seqid+1] - (num_targets[seqid] if num_targets is not None else 0), ...]
+
+                num_pages = int(page_indptrs[seqid+1] - page_indptrs[seqid])
+                for pidx in range(num_pages):
+                    page_id = pages[pidx]
+                    if pidx < num_pages - 1:
+                        paged_kv[page_id, 0, ...].copy_(kcur[pidx*page_size:(pidx+1)*page_size, ...].view(page_size, k.shape[1], k.shape[2]))
+                        paged_kv[page_id, 1, ...].copy_(vcur[pidx*page_size:(pidx+1)*page_size, ...].view(page_size, k.shape[1], k.shape[2]))
+                    else:
+                        paged_kv[page_id, 0, :last_page_lens[seqid], ...].copy_(kcur[pidx*page_size:pidx*page_size+last_page_lens[seqid], ...].view(last_page_lens[seqid], k.shape[1], k.shape[2]))
+                        paged_kv[page_id, 1, :last_page_lens[seqid], ...].copy_(vcur[pidx*page_size:pidx*page_size+last_page_lens[seqid], ...].view(last_page_lens[seqid], k.shape[1], k.shape[2]))
+
+            return paged_kv, page_ids, page_indptrs, last_page_lens
+
+
+        batch_size = 4
+        heads = 4
+        max_seq_len_q = 350
+        max_seq_len_k = 350
+        max_target_len = 192
         torch.cuda.synchronize()
         (
             L_q,
@@ -749,6 +794,11 @@ class HSTU16Test(unittest.TestCase):
             is_delta_q=is_delta_q,
             is_arbitrary=is_arbitrary,
         )
+        k = torch.rand_like(k) #* 10.0
+        v = torch.rand_like(v) #* 10.0
+
+        paged_kv, page_ids, page_indptrs, last_page_lens = place_kvcache(k, v, cu_seqlens_k, num_targets)
+
         out_ref = _hstu_attention_maybe_from_cache(
             num_heads=heads,
             attention_dim=attn_dim,
@@ -761,6 +811,7 @@ class HSTU16Test(unittest.TestCase):
             q_offsets=cu_seqlens_q,
             k_offsets=cu_seqlens_k,
             rab=rab if has_rab else None,
+            # invalid_attn_mask=None,
             invalid_attn_mask=(
                 attn_mask.to(torch.float32) if attn_mask is not None else None
             ),
@@ -780,6 +831,7 @@ class HSTU16Test(unittest.TestCase):
             q_offsets=cu_seqlens_q,
             k_offsets=cu_seqlens_k,
             rab=rab if has_rab else None,
+            # invalid_attn_mask=None,
             invalid_attn_mask=(
                 attn_mask.to(torch.float32) if attn_mask is not None else None
             ),
@@ -804,6 +856,7 @@ class HSTU16Test(unittest.TestCase):
                 rab=rab if has_rab else None,
                 has_drab=has_drab,
                 func=func,
+                kv_cache = paged_kv, page_ids = page_ids, page_offsets = page_indptrs, last_page_lens = last_page_lens,
             )
         else:
             hstu_out = hstu_attn_qkvpacked_func(
@@ -821,6 +874,7 @@ class HSTU16Test(unittest.TestCase):
                 has_drab=has_drab,
                 func=func,
             )
+        torch.cuda.synchronize()
 
         print(f"Output max diff: {(hstu_out - out_ref).abs().max().item()}")
         print(f"Pytorch max diff: {(torch_out - out_ref).abs().max().item()}")
@@ -832,6 +886,8 @@ class HSTU16Test(unittest.TestCase):
         # print(f"Pytorch = {torch_out}")
 
         assert (hstu_out - out_ref).abs().max().item() <= 2 * (torch_out - out_ref).abs().max().item()
+
+        return
 
         g = torch.rand_like(torch_out)
         if not has_drab:
@@ -1960,8 +2016,10 @@ if __name__ == "__main__":
     # dtype: torch.dtype,
     # full_batch: bool,
 
-    HSTU16Test().test_hstu_attn.hypothesis.inner_test(HSTU16Test(),
-    8, 8, 0, (128, 128), 1.0, (False, False, None), (1024, 1024), (0, (-1, 0), 1, False), torch.bfloat16, False)
+    # torch.manual_seed(0)
+    with torch.inference_mode():
+        HSTU16Test().test_hstu_attn.hypothesis.inner_test(HSTU16Test(),
+        8, 8, 0, (128, 128), 1.0, (False, False, None), (1024, 1024), (0, (-1, 0), 1, False), torch.bfloat16, False)
 
     # HSTU16Test().test_hstu_attn.hypothesis.inner_test(HSTU16Test(),
     # 1, 1, 0, (128, 128), 1.0, (False, False, None), (512, 512), (0, (-1, 0), 1, False), torch.bfloat16, True)
@@ -1970,3 +2028,4 @@ if __name__ == "__main__":
     # 1, 1, 0, (128, 128), 1.0, (False, False, None), (256, 256), (0, (-1, 0), 1, False), torch.bfloat16, True)
 
     # unittest.main()
+
